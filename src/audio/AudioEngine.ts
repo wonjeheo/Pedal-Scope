@@ -5,6 +5,7 @@ import type { WaveformType } from "../types";
 type RuntimeVoice = {
   oscillator: OscillatorNode;
   gain: GainNode;
+  baseGain: number;
   releaseTimer: number | null;
 };
 
@@ -17,11 +18,13 @@ export class AudioEngine {
   private context: AudioContext | null = null;
   private inputMixer: GainNode | null = null;
   private masterGain: GainNode | null = null;
+  private outputLimiter: DynamicsCompressorNode | null = null;
   private cleanAnalyser: AnalyserNode | null = null;
   private processedAnalyser: AnalyserNode | null = null;
   private voices = new Map<string, RuntimeVoice>();
   private chainNodes: AudioNode[] = [];
   private compressorNodes: DynamicsCompressorNode[] = [];
+  private configureVersion = 0;
 
   async start(sourceConfig: SourceConfig, chain: EffectModule[]) {
     this.stopVoices();
@@ -37,7 +40,24 @@ export class AudioEngine {
   async configure(chain: EffectModule[], masterGainValue: number) {
     await this.ensureContext();
 
-    if (!this.context || !this.inputMixer || !this.masterGain || !this.cleanAnalyser || !this.processedAnalyser) {
+    if (
+      !this.context ||
+      !this.inputMixer ||
+      !this.masterGain ||
+      !this.outputLimiter ||
+      !this.cleanAnalyser ||
+      !this.processedAnalyser
+    ) {
+      return;
+    }
+
+    const version = (this.configureVersion += 1);
+    const now = this.context.currentTime;
+    holdParamAtCurrentValue(this.masterGain.gain, now);
+    this.masterGain.gain.setTargetAtTime(0.0001, now, 0.004);
+    await sleep(12);
+
+    if (version !== this.configureVersion) {
       return;
     }
 
@@ -63,10 +83,12 @@ export class AudioEngine {
       previousNode = effectNodes[effectNodes.length - 1];
     });
 
-    this.masterGain.gain.setTargetAtTime(masterGainValue, this.context.currentTime, 0.01);
+    this.masterGain.gain.setValueAtTime(0.0001, this.context.currentTime);
+    this.masterGain.gain.setTargetAtTime(masterGainValue, this.context.currentTime, 0.012);
     this.inputMixer.connect(this.cleanAnalyser);
     previousNode.connect(this.masterGain);
-    this.masterGain.connect(this.processedAnalyser);
+    this.masterGain.connect(this.outputLimiter);
+    this.outputLimiter.connect(this.processedAnalyser);
     this.processedAnalyser.connect(this.context.destination);
   }
 
@@ -86,13 +108,14 @@ export class AudioEngine {
     oscillator.type = waveform;
     oscillator.frequency.setValueAtTime(note.frequency, now);
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, velocity), now + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.04, now + 0.012);
 
     oscillator.connect(gain);
     gain.connect(this.inputMixer);
     oscillator.start(now);
 
-    this.voices.set(id, { oscillator, gain, releaseTimer: null });
+    this.voices.set(id, { oscillator, gain, baseGain: velocity, releaseTimer: null });
+    this.normalizeVoiceGains();
   }
 
   noteOff(id: string, releaseSeconds = 0.9) {
@@ -109,15 +132,15 @@ export class AudioEngine {
     const now = this.context.currentTime;
     const stopAt = now + releaseSeconds + 0.05;
 
-    voice.gain.gain.cancelScheduledValues(now);
-    voice.gain.gain.setValueAtTime(Math.max(voice.gain.gain.value, 0.0001), now);
+    this.voices.delete(id);
+    holdParamAtCurrentValue(voice.gain.gain, now);
     voice.gain.gain.exponentialRampToValueAtTime(0.0001, now + releaseSeconds);
     voice.oscillator.stop(stopAt);
+    this.normalizeVoiceGains();
 
     voice.releaseTimer = window.setTimeout(() => {
       voice.oscillator.disconnect();
       voice.gain.disconnect();
-      this.voices.delete(id);
     }, (releaseSeconds + 0.08) * 1000);
   }
 
@@ -170,11 +193,17 @@ export class AudioEngine {
       this.context = new AudioContext();
       this.inputMixer = this.context.createGain();
       this.masterGain = this.context.createGain();
+      this.outputLimiter = this.context.createDynamicsCompressor();
       this.cleanAnalyser = this.context.createAnalyser();
       this.processedAnalyser = this.context.createAnalyser();
       this.cleanAnalyser.fftSize = 8192;
       this.processedAnalyser.fftSize = 8192;
       this.masterGain.gain.value = 0.35;
+      this.outputLimiter.threshold.value = -3;
+      this.outputLimiter.knee.value = 0;
+      this.outputLimiter.ratio.value = 20;
+      this.outputLimiter.attack.value = 0.003;
+      this.outputLimiter.release.value = 0.08;
     }
 
     if (this.context.state === "suspended") {
@@ -198,15 +227,28 @@ export class AudioEngine {
       window.clearTimeout(voice.releaseTimer);
     }
 
+    this.voices.delete(id);
+
+    if (!this.context) {
+      voice.oscillator.disconnect();
+      voice.gain.disconnect();
+      return;
+    }
+
+    const now = this.context.currentTime;
+    holdParamAtCurrentValue(voice.gain.gain, now);
+    voice.gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.025);
+
     try {
-      voice.oscillator.stop();
+      voice.oscillator.stop(now + 0.04);
     } catch {
       // The browser may have already stopped this oscillator.
     }
 
-    voice.oscillator.disconnect();
-    voice.gain.disconnect();
-    this.voices.delete(id);
+    window.setTimeout(() => {
+      voice.oscillator.disconnect();
+      voice.gain.disconnect();
+    }, 60);
   }
 
   private disconnectGraph() {
@@ -215,9 +257,36 @@ export class AudioEngine {
     this.chainNodes = [];
     this.compressorNodes = [];
     this.masterGain?.disconnect();
+    this.outputLimiter?.disconnect();
     this.cleanAnalyser?.disconnect();
     this.processedAnalyser?.disconnect();
   }
+
+  private normalizeVoiceGains() {
+    if (!this.context) {
+      return;
+    }
+
+    const activeVoices = Array.from(this.voices.values());
+    const voiceCount = Math.max(activeVoices.length, 1);
+    const scale = 1 / Math.sqrt(voiceCount);
+    const now = this.context.currentTime;
+
+    activeVoices.forEach((voice) => {
+      holdParamAtCurrentValue(voice.gain.gain, now);
+      voice.gain.gain.setTargetAtTime(Math.max(0.0001, voice.baseGain * scale), now, 0.018);
+    });
+  }
+}
+
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+}
+
+function holdParamAtCurrentValue(param: AudioParam, time: number) {
+  param.cancelAndHoldAtTime(time);
 }
 
 function createEffectNodes(context: AudioContext, effect: EffectModule): EffectNodeResult {
@@ -244,7 +313,7 @@ function createEffectNodes(context: AudioContext, effect: EffectModule): EffectN
     const level = context.createGain();
 
     distortion.oversample = "4x";
-    distortion.curve = createDriveCurve(effect.params.amount ?? 0.25, "hard");
+    distortion.curve = createDriveCurve(effect.params.amount ?? 0.25, "hard", effect.params.bias ?? 0);
     level.gain.value = effect.params.level ?? 0.6;
     distortion.connect(level);
 
@@ -294,17 +363,23 @@ function createEffectNodes(context: AudioContext, effect: EffectModule): EffectN
   return { nodes: [filter] };
 }
 
-function createDriveCurve(amount: number, mode: "soft" | "hard") {
+function createDriveCurve(amount: number, mode: "soft" | "hard", bias = 0) {
   const samples = 44100;
   const curve = new Float32Array(samples);
   const drive = mode === "hard" ? 1 + amount * 160 : 1 + amount * 70;
+  const clampedBias = Math.max(-1, Math.min(1, bias));
+  const positiveLimit = 1 - Math.max(clampedBias, 0) * 0.55;
+  const negativeLimit = -1 + Math.max(-clampedBias, 0) * 0.55;
 
   for (let i = 0; i < samples; i += 1) {
     const x = (i * 2) / samples - 1;
-    curve[i] =
-      mode === "hard"
-        ? Math.tanh(drive * x)
-        : ((1 + drive) * x) / (1 + drive * Math.abs(x));
+
+    if (mode === "hard") {
+      const shaped = Math.tanh(drive * x);
+      curve[i] = Math.max(negativeLimit, Math.min(positiveLimit, shaped));
+    } else {
+      curve[i] = ((1 + drive) * x) / (1 + drive * Math.abs(x));
+    }
   }
 
   return curve;

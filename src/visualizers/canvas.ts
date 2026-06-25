@@ -49,6 +49,42 @@ export function drawWaveformOverlay(
   drawWaveformLine(ctx, processedData, width, height, "#f3b27b", 2);
 }
 
+export function drawCycleWaveform(
+  canvas: HTMLCanvasElement,
+  cleanData: Uint8Array<ArrayBuffer>,
+  processedData: Uint8Array<ArrayBuffer>,
+  frequency: number,
+  sampleRate: number,
+) {
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return;
+  }
+
+  const { width, height } = canvas;
+  clearCanvas(ctx, width, height);
+  drawGrid(ctx, width, height);
+
+  ctx.strokeStyle = "rgba(198, 210, 203, 0.18)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, height / 2);
+  ctx.lineTo(width, height / 2);
+  ctx.stroke();
+
+  if (frequency <= 0 || sampleRate <= 0) {
+    return;
+  }
+
+  const samplesPerCycle = Math.max(8, Math.min(processedData.length, Math.round(sampleRate / frequency)));
+  const processedStart = findCycleStart(processedData, samplesPerCycle);
+  const cleanStart = findCycleStart(cleanData, samplesPerCycle);
+
+  drawCycleLine(ctx, cleanData, cleanStart, samplesPerCycle, width, height, "rgba(126, 168, 146, 0.9)", 1.5);
+  drawCycleLine(ctx, processedData, processedStart, samplesPerCycle, width, height, "#f3b27b", 2);
+}
+
 export function drawSpectrum(canvas: HTMLCanvasElement, data: Uint8Array<ArrayBuffer>) {
   const ctx = canvas.getContext("2d");
 
@@ -169,7 +205,27 @@ export function drawEnvelope(canvas: HTMLCanvasElement, values: number[]) {
   ctx.fillRect(0, height - Math.min(latest / maxValue, 1) * height, width, height);
 }
 
-export function drawTransferCurve(canvas: HTMLCanvasElement, amount: number, mode: "soft" | "hard") {
+export function drawEnvelopeOverlay(canvas: HTMLCanvasElement, values: number[]) {
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return;
+  }
+
+  const { width, height } = canvas;
+
+  clearCanvas(ctx, width, height);
+  drawGrid(ctx, width, height);
+
+  drawEnvelopeLine(ctx, values, width, height, "#7ea892");
+
+  const latest = values.at(-1) ?? 0;
+  const maxValue = 0.75;
+  ctx.fillStyle = "rgba(126, 168, 146, 0.16)";
+  ctx.fillRect(0, height - Math.min(latest / maxValue, 1) * height, width, height);
+}
+
+export function drawTransferCurve(canvas: HTMLCanvasElement, amount: number, mode: "soft" | "hard", bias = 0) {
   const ctx = canvas.getContext("2d");
 
   if (!ctx) {
@@ -189,13 +245,20 @@ export function drawTransferCurve(canvas: HTMLCanvasElement, amount: number, mod
   ctx.stroke();
 
   const drive = mode === "hard" ? 1 + amount * 160 : 1 + amount * 70;
+  const clampedBias = Math.max(-1, Math.min(1, bias));
+  const positiveLimit = 1 - Math.max(clampedBias, 0) * 0.55;
+  const negativeLimit = -1 + Math.max(-clampedBias, 0) * 0.55;
   ctx.lineWidth = 2;
   ctx.strokeStyle = "#f3b27b";
   ctx.beginPath();
 
   for (let i = 0; i <= width; i += 1) {
     const x = (i / width) * 2 - 1;
-    const yValue = mode === "hard" ? Math.tanh(drive * x) : ((1 + drive) * x) / (1 + drive * Math.abs(x));
+    const shaped = Math.tanh(drive * x);
+    const yValue =
+      mode === "hard"
+        ? Math.max(negativeLimit, Math.min(positiveLimit, shaped))
+        : ((1 + drive) * x) / (1 + drive * Math.abs(x));
     const y = height / 2 - (yValue * height) / 2;
 
     if (i === 0) {
@@ -360,9 +423,11 @@ function drawWaveformLine(
   height: number,
   color: string,
   lineWidth: number,
+  dash: number[] = [],
 ) {
   ctx.lineWidth = lineWidth;
   ctx.strokeStyle = color;
+  ctx.setLineDash(dash);
   ctx.beginPath();
 
   const sliceWidth = width / data.length;
@@ -379,6 +444,86 @@ function drawWaveformLine(
   }
 
   ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function findCycleStart(data: Uint8Array<ArrayBuffer>, samplesPerCycle: number) {
+  const center = Math.floor(data.length / 2);
+  const searchStart = Math.max(1, center - samplesPerCycle);
+  const searchEnd = Math.min(data.length - samplesPerCycle - 1, center + samplesPerCycle);
+
+  for (let i = searchStart; i < searchEnd; i += 1) {
+    const previous = data[i - 1] - 128;
+    const current = data[i] - 128;
+
+    if (previous <= 0 && current > 0) {
+      return i;
+    }
+  }
+
+  return Math.max(0, Math.min(data.length - samplesPerCycle, center - Math.floor(samplesPerCycle / 2)));
+}
+
+function drawCycleLine(
+  ctx: CanvasRenderingContext2D,
+  data: Uint8Array<ArrayBuffer>,
+  start: number,
+  samplesPerCycle: number,
+  width: number,
+  height: number,
+  color: string,
+  lineWidth: number,
+) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.beginPath();
+
+  for (let i = 0; i < samplesPerCycle; i += 1) {
+    const sampleIndex = Math.min(start + i, data.length - 1);
+    const x = samplesPerCycle > 1 ? (i / (samplesPerCycle - 1)) * width : 0;
+    const centered = (data[sampleIndex] - 128) / 128;
+    const y = height / 2 - centered * (height * 0.42);
+
+    if (i === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+
+  ctx.stroke();
+}
+
+function drawEnvelopeLine(
+  ctx: CanvasRenderingContext2D,
+  values: number[],
+  width: number,
+  height: number,
+  color: string,
+  dash: number[] = [],
+) {
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = color;
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+
+  const maxValue = 0.75;
+  const sliceWidth = values.length > 1 ? width / (values.length - 1) : width;
+
+  values.forEach((value, index) => {
+    const normalized = Math.min(value / maxValue, 1);
+    const x = index * sliceWidth;
+    const y = height - normalized * height;
+
+    if (index === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 function drawGrid(ctx: CanvasRenderingContext2D, width: number, height: number) {

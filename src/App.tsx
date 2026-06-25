@@ -7,7 +7,8 @@ import {
   calculateRms,
   drawCombFilterResponse,
   drawCompressorCurve,
-  drawEnvelope,
+  drawCycleWaveform,
+  drawEnvelopeOverlay,
   drawFilterResponse,
   drawSpectrumOverlay,
   drawTransferCurve,
@@ -22,6 +23,7 @@ const processedFrequencyData = new Uint8Array(4096);
 const envelopeHistoryLength = 180;
 const spectrumDisplayMaxFrequency = 6000;
 type SourceMode = "single" | "chord";
+type SourceInstrument = "keyboard" | "guitar" | "bass";
 
 const EFFECT_PARAM_DEFS: Record<EffectModule["type"], EffectParam[]> = {
   gain: [{ key: "level", label: "Level", min: 0, max: 2, step: 0.01 }],
@@ -31,6 +33,7 @@ const EFFECT_PARAM_DEFS: Record<EffectModule["type"], EffectParam[]> = {
   ],
   distortion: [
     { key: "amount", label: "Amount", min: 0, max: 1, step: 0.01 },
+    { key: "bias", label: "Bias", min: -1, max: 1, step: 0.01 },
     { key: "level", label: "Level", min: 0, max: 1.2, step: 0.01 },
   ],
   compressor: [
@@ -70,7 +73,7 @@ const DEFAULT_CHAIN: EffectModule[] = [
     type: "distortion",
     name: "Clip Dist",
     enabled: false,
-    params: { amount: 0.25, level: 0.55 },
+    params: { amount: 0.25, bias: 0, level: 0.55 },
   },
   {
     id: "compressor",
@@ -117,6 +120,19 @@ const KEYBOARD_LAYOUT = [
 
 const KEY_TO_MIDI: Map<string, number> = new Map(KEYBOARD_LAYOUT.map((item) => [item.key, item.midi]));
 
+const SOURCE_INSTRUMENTS: SourceInstrument[] = ["keyboard", "guitar", "bass"];
+
+const STRING_INSTRUMENTS: Record<Exclude<SourceInstrument, "keyboard">, { frets: number; strings: number[] }> = {
+  guitar: {
+    frets: 12,
+    strings: [64, 59, 55, 50, 45, 40],
+  },
+  bass: {
+    frets: 12,
+    strings: [43, 38, 33, 28],
+  },
+};
+
 export default function App() {
   const notes = useMemo(() => createTwoOctaveNoteList(48, 36), []);
   const engineRef = useRef(new AudioEngine());
@@ -124,11 +140,13 @@ export default function App() {
   const spectrumCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const envelopeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const helperCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cycleCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
   const [isAudioArmed, setIsAudioArmed] = useState(false);
   const [selectedMidi, setSelectedMidi] = useState(57);
   const [sourceMode, setSourceMode] = useState<SourceMode>("single");
+  const [sourceInstrument, setSourceInstrument] = useState<SourceInstrument>("keyboard");
   const [chordQuality, setChordQuality] = useState<ChordQuality>("minor");
   const [voicing, setVoicing] = useState<VoicingType>("close");
   const [waveform, setWaveform] = useState<WaveformType>("sine");
@@ -142,6 +160,7 @@ export default function App() {
   const chainRef = useRef(chain);
   const masterGainRef = useRef(masterGain);
   const waveformRef = useRef(waveform);
+  const sourceInstrumentRef = useRef(sourceInstrument);
   const sourceModeRef = useRef(sourceMode);
   const chordQualityRef = useRef(chordQuality);
   const voicingRef = useRef(voicing);
@@ -159,6 +178,7 @@ export default function App() {
   );
   const spectrumMarkers = useMemo(() => buildSpectrumMarkers(activeNotes), [activeNotes]);
   const selectedEffect = chain.find((effect) => effect.id === selectedEffectId) ?? chain[0];
+  const cycleFrequency = activeNotes[0]?.frequency ?? selectedNote.frequency;
 
   useEffect(() => {
     drawIdleVisualizers();
@@ -175,6 +195,10 @@ export default function App() {
   useEffect(() => {
     waveformRef.current = waveform;
   }, [waveform]);
+
+  useEffect(() => {
+    sourceInstrumentRef.current = sourceInstrument;
+  }, [sourceInstrument]);
 
   useEffect(() => {
     sourceModeRef.current = sourceMode;
@@ -198,7 +222,7 @@ export default function App() {
     }
 
     drawIdleVisualizers();
-  }, [isAudioArmed, selectedEffect, spectrumMarkers]);
+  }, [cycleFrequency, isAudioArmed, selectedEffect, spectrumMarkers]);
 
   useEffect(() => {
     if (!isAudioArmed) {
@@ -222,8 +246,9 @@ export default function App() {
       const spectrumCanvas = spectrumCanvasRef.current;
       const envelopeCanvas = envelopeCanvasRef.current;
       const helperCanvas = helperCanvasRef.current;
+      const cycleCanvas = cycleCanvasRef.current;
 
-      if (!waveformCanvas || !spectrumCanvas || !envelopeCanvas || !helperCanvas) {
+      if (!waveformCanvas || !spectrumCanvas || !envelopeCanvas || !helperCanvas || !cycleCanvas) {
         return;
       }
 
@@ -233,6 +258,7 @@ export default function App() {
       engineRef.current.getProcessedFrequencyData(processedFrequencyData);
       spectrumMaxFrequencyRef.current = engineRef.current.getSpectrumMaxFrequency();
       drawWaveformOverlay(waveformCanvas, cleanTimeData, processedTimeData);
+      drawCycleWaveform(cycleCanvas, cleanTimeData, processedTimeData, cycleFrequency, spectrumMaxFrequencyRef.current * 2);
       drawSpectrumOverlay(
         spectrumCanvas,
         cleanFrequencyData,
@@ -244,7 +270,7 @@ export default function App() {
 
       const rms = calculateRms(processedTimeData);
       envelopeHistoryRef.current = [...envelopeHistoryRef.current.slice(1), rms];
-      drawEnvelope(envelopeCanvas, envelopeHistoryRef.current);
+      drawEnvelopeOverlay(envelopeCanvas, envelopeHistoryRef.current);
 
       const nextReduction = engineRef.current.getCompressorReduction();
       if (Math.abs(nextReduction - compressorReductionRef.current) > 0.15) {
@@ -264,13 +290,17 @@ export default function App() {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [isAudioArmed, selectedEffect, spectrumMarkers]);
+  }, [cycleFrequency, isAudioArmed, selectedEffect, spectrumMarkers]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
 
       if (event.repeat || target?.matches("input, select, textarea, button")) {
+        return;
+      }
+
+      if (sourceInstrumentRef.current !== "keyboard") {
         return;
       }
 
@@ -286,6 +316,10 @@ export default function App() {
     }
 
     function handleKeyUp(event: KeyboardEvent) {
+      if (sourceInstrumentRef.current !== "keyboard") {
+        return;
+      }
+
       const key = event.key.toLowerCase();
 
       if (!KEY_TO_MIDI.has(key)) {
@@ -365,8 +399,9 @@ export default function App() {
     const spectrumCanvas = spectrumCanvasRef.current;
     const envelopeCanvas = envelopeCanvasRef.current;
     const helperCanvas = helperCanvasRef.current;
+    const cycleCanvas = cycleCanvasRef.current;
 
-    if (!waveformCanvas || !spectrumCanvas || !envelopeCanvas || !helperCanvas) {
+    if (!waveformCanvas || !spectrumCanvas || !envelopeCanvas || !helperCanvas || !cycleCanvas) {
       return;
     }
 
@@ -376,6 +411,7 @@ export default function App() {
     processedFrequencyData.fill(0);
     envelopeHistoryRef.current = Array(envelopeHistoryLength).fill(0);
     drawWaveformOverlay(waveformCanvas, cleanTimeData, processedTimeData);
+    drawCycleWaveform(cycleCanvas, cleanTimeData, processedTimeData, cycleFrequency, spectrumMaxFrequencyRef.current * 2);
     drawSpectrumOverlay(
       spectrumCanvas,
       cleanFrequencyData,
@@ -384,7 +420,7 @@ export default function App() {
       spectrumDisplayMaxFrequency,
       spectrumMaxFrequencyRef.current,
     );
-    drawEnvelope(envelopeCanvas, envelopeHistoryRef.current);
+    drawEnvelopeOverlay(envelopeCanvas, envelopeHistoryRef.current);
     drawEffectHelper(helperCanvas, selectedEffect, spectrumMaxFrequencyRef.current);
   }
 
@@ -528,47 +564,45 @@ export default function App() {
             </p>
             <p className="hint">{activeNotes.map((note) => `${note.frequency.toFixed(2)} Hz`).join(" / ")}</p>
           </div>
+
+          <div className="panel-section cycle-readout">
+            <div className="cycle-header">
+              <h2>Cycle</h2>
+              <span>{cycleFrequency.toFixed(1)} Hz</span>
+            </div>
+            <SignalLegend />
+            <canvas ref={cycleCanvasRef} width="520" height="180" />
+          </div>
         </aside>
 
         <section className="visual-area" aria-label="Visualizers">
-          <section className="source-keyboard" aria-label="Computer keyboard source">
+          <section className="source-keyboard" aria-label="Instrument source">
             <div className="visualizer-header">
-              <h2>Keyboard Source</h2>
-              <span>sustain and release</span>
-            </div>
-            <div className="keyboard-bed">
-              {KEYBOARD_LAYOUT.map((item) => {
-                const note = midiToNote(item.midi);
-                const voiceId = `key-${item.key}`;
-                const pointerId = `pointer-${item.midi}`;
-                const isActive = activeVoiceIds.has(voiceId) || activeVoiceIds.has(pointerId);
-
-                return (
+              <h2>{sourceInstrument === "keyboard" ? "Keyboard Source" : `${capitalize(sourceInstrument)} Source`}</h2>
+              <div className="source-switch" role="group" aria-label="Source instrument">
+                {SOURCE_INSTRUMENTS.map((instrument) => (
                   <button
-                    key={`${item.key}-${item.midi}`}
+                    key={instrument}
+                    className={sourceInstrument === instrument ? "active" : ""}
                     type="button"
-                    className={`piano-key ${item.color} ${isActive ? "active" : ""}`}
-                    onPointerDown={(event) => {
-                      event.currentTarget.setPointerCapture(event.pointerId);
-                      void noteOn(pointerId, item.midi);
-                    }}
-                    onPointerUp={() => noteOff(pointerId)}
-                    onPointerCancel={() => noteOff(pointerId)}
-                    onPointerLeave={(event) => {
-                      if (event.buttons === 1) {
-                        noteOff(pointerId);
-                      }
-                    }}
+                    aria-pressed={sourceInstrument === instrument}
+                    onClick={() => setSourceInstrument(instrument)}
                   >
-                    <span className="computer-key">{item.key.toUpperCase()}</span>
-                    <span className="note-label">
-                      {note.name}
-                      {note.octave}
-                    </span>
+                    {capitalize(instrument)}
                   </button>
-                );
-              })}
+                ))}
+              </div>
             </div>
+            {sourceInstrument === "keyboard" ? (
+              <KeyboardSource activeVoiceIds={activeVoiceIds} noteOn={noteOn} noteOff={noteOff} />
+            ) : (
+              <StringSource
+                activeVoiceIds={activeVoiceIds}
+                instrument={sourceInstrument}
+                noteOn={noteOn}
+                noteOff={noteOff}
+              />
+            )}
           </section>
 
           <section className="pedalboard" aria-label="Effect chain">
@@ -689,7 +723,7 @@ function drawEffectHelper(canvas: HTMLCanvasElement, effect: EffectModule, maxFr
   }
 
   if (effect.type === "distortion") {
-    drawTransferCurve(canvas, effect.params.amount ?? 0.25, "hard");
+    drawTransferCurve(canvas, effect.params.amount ?? 0.25, "hard", effect.params.bias ?? 0);
     return;
   }
 
@@ -740,6 +774,116 @@ function drawGainHelper(canvas: HTMLCanvasElement, level: number) {
   ctx.moveTo(0, y);
   ctx.lineTo(width, y);
   ctx.stroke();
+}
+
+type SourceViewProps = {
+  activeVoiceIds: Set<string>;
+  noteOn: (id: string, midi: number) => Promise<void>;
+  noteOff: (id: string) => void;
+};
+
+function KeyboardSource({ activeVoiceIds, noteOn, noteOff }: SourceViewProps) {
+  return (
+    <div className="keyboard-bed">
+      {KEYBOARD_LAYOUT.map((item) => {
+        const note = midiToNote(item.midi);
+        const voiceId = `key-${item.key}`;
+        const pointerId = `pointer-${item.midi}`;
+        const isActive = activeVoiceIds.has(voiceId) || activeVoiceIds.has(pointerId);
+
+        return (
+          <button
+            key={`${item.key}-${item.midi}`}
+            type="button"
+            className={`piano-key ${item.color} ${isActive ? "active" : ""}`}
+            onPointerDown={(event) => {
+              event.currentTarget.setPointerCapture(event.pointerId);
+              void noteOn(pointerId, item.midi);
+            }}
+            onPointerUp={() => noteOff(pointerId)}
+            onPointerCancel={() => noteOff(pointerId)}
+            onPointerLeave={(event) => {
+              if (event.buttons === 1) {
+                noteOff(pointerId);
+              }
+            }}
+          >
+            <span className="computer-key">{item.key.toUpperCase()}</span>
+            <span className="note-label">
+              {note.name}
+              {note.octave}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+type StringSourceProps = SourceViewProps & {
+  instrument: Exclude<SourceInstrument, "keyboard">;
+};
+
+function StringSource({ activeVoiceIds, instrument, noteOn, noteOff }: StringSourceProps) {
+  const layout = STRING_INSTRUMENTS[instrument];
+  const frets = Array.from({ length: layout.frets + 1 }, (_, index) => index);
+
+  return (
+    <div className={`fretboard ${instrument}`}>
+      <div className="fret-numbers" aria-hidden="true">
+        <span />
+        {frets.map((fret) => (
+          <span key={fret}>{fret}</span>
+        ))}
+      </div>
+      {layout.strings.map((openMidi, stringIndex) => {
+        const openNote = midiToNote(openMidi);
+
+        return (
+          <div className="string-row" key={`${instrument}-${openMidi}-${stringIndex}`}>
+            <span className="string-label">
+              {openNote.name}
+              {openNote.octave}
+            </span>
+            {frets.map((fret) => {
+              const midi = openMidi + fret;
+              const note = midiToNote(midi);
+              const pointerId = `${instrument}-${stringIndex}-${fret}`;
+              const isActive = activeVoiceIds.has(pointerId);
+
+              return (
+                <button
+                  key={`${pointerId}-${midi}`}
+                  type="button"
+                  className={`fret ${isActive ? "active" : ""}`}
+                  onPointerDown={(event) => {
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    void noteOn(pointerId, midi);
+                  }}
+                  onPointerUp={() => noteOff(pointerId)}
+                  onPointerCancel={() => noteOff(pointerId)}
+                  onPointerLeave={(event) => {
+                    if (event.buttons === 1) {
+                      noteOff(pointerId);
+                    }
+                  }}
+                >
+                  <span>
+                    {note.name}
+                    {note.octave}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function capitalize(value: string) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function SignalLegend() {
